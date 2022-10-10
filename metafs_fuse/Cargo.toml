@@ -1,0 +1,15 @@
+[package]
+name = "metafs_fuse"
+version = "0.1.0"
+edition = "2021"
+
+[profile.release]
+strip = true
+
+[dependencies]
+metafs = { path = "../metafs" }
+fuser = "0.11.1"
+gumdrop = "0.8.1"
+libc = "0.2.133"
+memmap2 = "0.5.7"
+simple_logger = "2.3.0"

@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "metafs",
+    "metafs_fuse",
+]
+
