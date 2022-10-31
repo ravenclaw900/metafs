@@ -33,6 +33,8 @@ pub enum Error {
     BlockIsNone,
     #[error("file of size {0} is too big (expected less than 4.26 GB)")]
     FileTooBig(usize),
+    #[error("requested {0} bytes, file is only {1} bytes")]
+    RequestTooBig(u32, u32),
     #[error(transparent)]
     SerializationError(#[from] bincode::error::EncodeError),
     #[error(transparent)]
@@ -66,6 +68,18 @@ impl bincode::Decode for OptionalU32 {
         decoder: &mut D,
     ) -> std::result::Result<Self, bincode::error::DecodeError> {
         match u32::decode(decoder) {
+            // If it's zero, it will return None
+            Ok(x) => Ok(Self(NonZeroU32::new(x))),
+            Err(x) => Err(x),
+        }
+    }
+}
+
+impl<'de> bincode::BorrowDecode<'de> for OptionalU32 {
+    fn borrow_decode<D: bincode::de::BorrowDecoder<'de>>(
+        decoder: &mut D,
+    ) -> std::result::Result<Self, bincode::error::DecodeError> {
+        match u32::borrow_decode(decoder) {
             // If it's zero, it will return None
             Ok(x) => Ok(Self(NonZeroU32::new(x))),
             Err(x) => Err(x),
@@ -528,7 +542,10 @@ impl<'a> MetaFS<'a> {
     pub fn check_if_inode_exists(&self, num: InodeNumber) -> bool {
         let bitmap: &bitvec::slice::BitSlice<u8, Lsb0> = self
             .get_slice(
-                num.group(self.superblock.inodes_per_group),
+                num.group(self.superblock.inodes_per_group)
+                    * self.superblock.blocks_per_group
+                    * self.superblock.block_size
+                    + self.superblock.block_size,
                 self.superblock.block_size,
             )
             .view_bits();
@@ -561,6 +578,7 @@ impl<'a> MetaFS<'a> {
 
     #[inline]
     pub fn get_block_from_num(&self, num: BlockNumber) -> Result<MultiBlock> {
+        dbg!(num);
         if !self.check_if_block_exists(num) {
             return Err(Error::NoExist("block"));
         }
@@ -573,7 +591,10 @@ impl<'a> MetaFS<'a> {
     pub fn check_if_block_exists(&self, num: BlockNumber) -> bool {
         let bitmap: &bitvec::slice::BitSlice<u8, Lsb0> = self
             .get_slice(
-                num / self.superblock.blocks_per_group,
+                // Integer division, so the dividing and multiplying is required
+                num / self.superblock.blocks_per_group
+                    * self.superblock.blocks_per_group
+                    * self.superblock.block_size,
                 self.superblock.block_size,
             )
             .view_bits();
@@ -747,109 +768,147 @@ impl<'a> MetaFS<'a> {
         )
     }
 
-    fn get_block_range_from_offset_size(
+    const fn get_block_range_from_offset_size(
         &self,
-        offset: u32,
-        size: u32,
+        mut offset: u32,
+        mut size: u32,
         file_name_len: u32,
-    ) -> [(u32, u32); 2] {
-        let name_block_len = self.superblock.block_size - 24 - file_name_len;
-        let normal_block_len = self.superblock.block_size - 16;
+    ) -> ((u32, u32), (u32, u32)) {
+        let name_block_size = self.superblock.block_size - 24 - file_name_len;
+        let normal_block_size = self.superblock.block_size - 16;
+        let remaining_block_size;
+
+        // If the data is in the name block, just use that data
+        let start = if offset < name_block_size {
+            remaining_block_size = name_block_size - offset;
+            (0, offset)
+        } else {
+            // Otherwise, remove the data in the name block from the offset
+            offset -= name_block_size;
+            remaining_block_size = normal_block_size - (offset % normal_block_size);
+            // Add 1 to account for name block
+            (offset / normal_block_size + 1, offset % normal_block_size)
+        };
+
+        let end = if size < remaining_block_size {
+            (start.0, start.1 + size)
+        } else {
+            size -= remaining_block_size;
+            (
+                // Add 1 to account for end of other block
+                start.0 + 1 + (size / normal_block_size),
+                size % normal_block_size,
+            )
+        };
+
+        (start, end)
+    }
+
+    #[inline]
+    fn read_pointer_block(&self, num: BlockNumber) -> Result<Vec<u32>> {
+        let data = self.get_block_from_num(num)?;
+
+        let pointers = match data {
+            // Should always be a pointer block
+            MultiBlock::Pointers(block_pointers) => *block_pointers,
+            _ => unreachable!(),
+        };
+
+        Ok(pointers
+            .into_iter()
+            .filter_map(|x| x.0.map(NonZeroU32::get))
+            .collect())
     }
 
     pub fn read_data(&self, offset: u32, size: u32, inode: &Inode) -> Result<Vec<u8>> {
+        if offset + size > inode.file_size {
+            return Err(Error::RequestTooBig(offset + size, inode.file_size));
+        }
+
+        let ((start_block, start_offset), (end_block, end_offset)) =
+            self.get_block_range_from_offset_size(offset, size, 8);
+
+        // Using loop for control flow
+        #[allow(clippy::never_loop)]
+        let blocks = loop {
+            let mut blocks = Vec::with_capacity((end_block - start_block) as usize);
+
+            if start_block < 14 {
+                blocks.extend(
+                    inode
+                        .direct_blocks
+                        .iter()
+                        .filter_map(|x| x.0.map(NonZeroU32::get)),
+                );
+            };
+
+            if end_block < 15 {
+                break blocks;
+            }
+
+            if start_block < 1037 {
+                if let Some(indirect_block) = inode.indirect_block.0 {
+                    let indirect_block = indirect_block.get();
+
+                    let mut pointers = self.read_pointer_block(indirect_block)?;
+
+                    blocks.append(&mut pointers);
+                } else {
+                    unreachable!()
+                }
+            }
+
+            // Less than first double indirect pointed block
+            if end_block < 1037 {
+                break blocks;
+            }
+
+            if let Some(double_indirect_block) = inode.double_indirect_block.0 {
+                let double_indirect_block = double_indirect_block.get();
+
+                let indirect_block_pointers = self.read_pointer_block(double_indirect_block)?;
+
+                for i in indirect_block_pointers {
+                    let pointers = self.read_pointer_block(i)?;
+
+                    for (j, idx) in pointers.into_iter().zip(0..u32::MAX) {
+                        if end_block < 1037 + 1022 * idx {
+                            break;
+                        }
+
+                        let mut pointers = self.read_pointer_block(j)?;
+
+                        blocks.append(&mut pointers);
+                    }
+                }
+            }
+
+            break blocks;
+        };
+
         let mut file_data: Vec<u8> = Vec::with_capacity(inode.file_size as usize);
 
-        for i in inode.direct_blocks {
-            let i = match i.0 {
-                Some(i) => i.get(),
-                None => break,
-            };
-            let block_slice = self.get_block_slice_from_num(i);
-            verify_checksum(block_slice, format!("data block {}", i))?;
-            let data: MultiBlock = bincode::decode_from_slice(&block_slice[4..], BINCODE_CFG)?.0;
+        for (i, idx) in blocks
+            .into_iter()
+            .zip(0..u32::MAX)
+            .filter(|&(_, idx)| idx >= start_block && idx <= end_block)
+        {
+            let data = self.get_block_from_num(i)?;
             match data {
                 MultiBlock::FileData(mut block_data)
                 | MultiBlock::FileDataWithName(_, mut block_data) => {
-                    file_data.append(&mut block_data)
+                    if idx == start_block && idx == end_block {
+                        file_data.extend(&block_data[start_offset as usize..end_offset as usize]);
+                    } else if idx == start_block {
+                        file_data.extend(&block_data[start_offset as usize..]);
+                    } else if idx == end_block {
+                        file_data.extend(&block_data[..end_offset as usize]);
+                    } else {
+                        file_data.append(&mut block_data);
+                    }
                 }
-                // Direct pointers should never point to a pointer block
+                // These blocks should always contain data
                 MultiBlock::Pointers(_) => unreachable!(),
-            }
-        }
-
-        if let Some(indirect_block) = inode.indirect_block.0 {
-            let indirect_block = indirect_block.get();
-
-            let pointers = {
-                let data = self.get_block_from_num(indirect_block)?;
-
-                match data {
-                    // Should always be a pointer block
-                    MultiBlock::Pointers(block_pointers) => *block_pointers,
-                    _ => unreachable!(),
-                }
-            };
-
-            for i in pointers {
-                let i = match i.0 {
-                    Some(i) => i.get(),
-                    None => break,
-                };
-
-                let data = self.get_block_from_num(i)?;
-
-                match data {
-                    // Should always be a normal data block
-                    MultiBlock::FileData(mut block_data) => file_data.append(&mut block_data),
-                    _ => unreachable!(),
-                }
-            }
-        }
-
-        if let Some(double_indirect_block) = inode.double_indirect_block.0 {
-            let double_indirect_block = double_indirect_block.get();
-
-            let indirect_block_pointers = {
-                let data = self.get_block_from_num(double_indirect_block)?;
-
-                match data {
-                    // Should always be a pointer block
-                    MultiBlock::Pointers(block_pointers) => *block_pointers,
-                    _ => unreachable!(),
-                }
-            };
-
-            for i in indirect_block_pointers {
-                let i = match i.0 {
-                    Some(i) => i.get(),
-                    None => break,
-                };
-
-                let pointers = {
-                    let data = self.get_block_from_num(i)?;
-
-                    match data {
-                        // Should always be a pointer block
-                        MultiBlock::Pointers(block_pointers) => *block_pointers,
-                        _ => unreachable!(),
-                    }
-                };
-
-                for j in pointers {
-                    let j = match j.0 {
-                        Some(j) => j.get(),
-                        None => break,
-                    };
-
-                    let data = self.get_block_from_num(j)?;
-
-                    match data {
-                        // Should always be a normal data block
-                        MultiBlock::FileData(mut block_data) => file_data.append(&mut block_data),
-                        _ => unreachable!(),
-                    }
-                }
             }
         }
 

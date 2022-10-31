@@ -10,6 +10,6 @@ strip = true
 metafs = { path = "../metafs" }
 fuser = "0.11.1"
 gumdrop = "0.8.1"
-libc = "0.2.133"
+libc = "0.2.137"
 memmap2 = "0.5.7"
 simple_logger = "2.3.0"

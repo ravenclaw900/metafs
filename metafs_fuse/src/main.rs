@@ -1,7 +1,7 @@
 use std::time::{Duration, UNIX_EPOCH};
 
 use fuser::{FileAttr, MountOption};
-use metafs::{Inode, InodeNumber, MetaFS};
+use metafs::{Inode, InodeNumber, MetaFS, TagTable};
 
 const TTL: Duration = Duration::from_secs(1);
 
@@ -264,7 +264,7 @@ impl<'a> fuser::Filesystem for MetaFSFuse<'a> {
         ino: u64,
         _fh: u64,
         offset: i64,
-        size: u32,
+        mut size: u32,
         _flags: i32,
         _lock_owner: Option<u64>,
         reply: fuser::ReplyData,
@@ -282,6 +282,11 @@ impl<'a> fuser::Filesystem for MetaFSFuse<'a> {
             }
         };
 
+        // Protect against RequestTooBig errors
+        if offset as u32 + size > inode.file_size {
+            size = inode.file_size - offset as u32
+        }
+
         let data = match self.inner.read_data(offset as u32, size, &inode) {
             Ok(data) => data,
             Err(e) => {
@@ -294,7 +299,7 @@ impl<'a> fuser::Filesystem for MetaFSFuse<'a> {
             }
         };
 
-        reply.data(&data[offset as usize..(offset as usize + size as usize).min(data.len())]);
+        reply.data(&data);
     }
 }
 
@@ -307,7 +312,17 @@ fn main() {
 
     let mut mmap = unsafe { memmap2::MmapMut::map_mut(&file).expect("couldn't memory map file") };
 
-    let fs = MetaFSFuse::new(&mut mmap);
+    let mut fs = MetaFSFuse::new(&mut mmap);
+
+    fs.inner.add_inode_to_tag(2, InodeNumber(32770));
+
+    dbg!(fs.inner.tags_iter().collect::<Vec<TagTable>>());
 
     fuser::mount2(fs, "/mnt/test", &[MountOption::RO]).expect("mounting fs failed");
+
+    //let inode = fs.inner.get_inode_from_num(InodeNumber(32772)).unwrap();
+
+    //println!("reading data");
+
+    //dbg!(std::str::from_utf8(&fs.inner.read_data(4721605, 6, &inode).unwrap()).unwrap());
 }
